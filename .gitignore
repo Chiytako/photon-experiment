@@ -1,0 +1,14 @@
+# virtualenv / caches
+.venv/
+__pycache__/
+*.pyc
+
+# tokenized datasets (regenerate with data.py)
+data/
+data2b/
+
+# model weights (too large for git; training/eval logs and result JSONs are kept)
+checkpoints/*.pt
+
+# raw nohup logs from long runs (structured logs live in checkpoints/*_log.jsonl)
+*.log

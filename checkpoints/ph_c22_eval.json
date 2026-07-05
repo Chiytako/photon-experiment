@@ -1,0 +1,10 @@
+{
+  "arch": "photon",
+  "run_name": "ph_c22",
+  "n_params": 35128192,
+  "eval_seq_len": 1024,
+  "fineweb_val_loss": 4.100229936200292,
+  "fineweb_val_ppl": 60.354163609054204,
+  "wikitext_loss": 5.159008898176588,
+  "wikitext_ppl": 173.99192640671131
+}

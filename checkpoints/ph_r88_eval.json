@@ -1,0 +1,10 @@
+{
+  "arch": "photon",
+  "run_name": "ph_r88",
+  "n_params": 37487488,
+  "eval_seq_len": 1024,
+  "fineweb_val_loss": 4.149518803578429,
+  "fineweb_val_ppl": 63.403483427067364,
+  "wikitext_loss": 5.59580902007965,
+  "wikitext_ppl": 269.2954273954036
+}

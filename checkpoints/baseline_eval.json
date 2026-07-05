@@ -1,0 +1,10 @@
+{
+  "arch": "baseline",
+  "run_name": "baseline",
+  "n_params": 43655680,
+  "eval_seq_len": 1024,
+  "fineweb_val_loss": 3.5299957056138314,
+  "fineweb_val_ppl": 34.123821073574476,
+  "wikitext_loss": 4.251574984541884,
+  "wikitext_ppl": 70.21591428401551
+}
