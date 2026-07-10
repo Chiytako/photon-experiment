@@ -24,16 +24,24 @@ from evaluate import load_model, CKPT_DIR
 BF16_BYTES = 2
 
 
-def kv_cache_gib(arch, cfg, batch_size, total_len, mode="hiergen"):
-    """Per-run KV-cache size in GiB at the end of generation (analytic)."""
+def kv_cache_gib(arch, cfg, batch_size, encoded_len, mode="hiergen"):
+    """Per-run KV-cache size in GiB, based on how many tokens actually flowed
+    through the encoders (`encoded_len`), NOT the full output length: PHOTON's
+    `_generate` never re-encodes a trailing partial meta-context (see its
+    `n_take < total_c: break`), so `encoded_len` = aligned prompt length plus
+    any FULL meta-contexts generated afterward. Passing the raw output length
+    would overcount the encoder KV whenever gen_len isn't a multiple of
+    total_downsample."""
     if arch == "baseline":
-        entries = cfg.n_layers * batch_size * total_len * cfg.dim
+        entries = cfg.n_layers * batch_size * encoded_len * cfg.dim
     else:
         dims = [cfg.d0] + [lv.dim for lv in cfg.levels]
-        m = total_len
+        m = encoded_len
         entries = 0
         for i, lv in enumerate(cfg.levels):
-            m //= lv.chunk_size  # encoder i runs at M_{i+1} = T / C_{<=i+1}
+            assert m % lv.chunk_size == 0, \
+                f"encoded_len {encoded_len} not aligned to level {i} chunk_size {lv.chunk_size}"
+            m //= lv.chunk_size  # encoder i runs at M_{i+1} = encoded_len / C_{<=i+1}
             is_top = i == cfg.num_levels - 1
             if mode == "hiergen" or is_top:
                 entries += lv.enc_layers * batch_size * m * dims[i + 1]
@@ -59,9 +67,10 @@ def run_once(model, arch, cfg, prompt_len, gen_len, batch_size, vocab_size,
     dt = time.time() - t0
 
     n_generated = out.shape[1] - pl
-    total_len = out.shape[1]
     mode = photon_mode if arch == "photon" else "hiergen"
-    kv_gib = kv_cache_gib(arch, cfg, batch_size, total_len, mode)
+    # baseline has no chunking (total_c=1), so this reduces to pl + n_generated
+    encoded_len = pl + (n_generated // total_c) * total_c
+    kv_gib = kv_cache_gib(arch, cfg, batch_size, encoded_len, mode)
     peak_mem_gib = torch.cuda.max_memory_allocated() / (1024 ** 3)
     throughput = (batch_size * n_generated) / dt
     return {
@@ -133,7 +142,8 @@ def main():
             speedup = p["throughput_tok_per_s"] / b["throughput_tok_per_s"]
             kv_ratio = b["kv_cache_gib"] / p["kv_cache_gib"] if p["kv_cache_gib"] > 0 else float("inf")
             tpm_ratio = (p["tpm_k_tok_per_s_per_gib"] / b["tpm_k_tok_per_s_per_gib"]
-                         if b["tpm_k_tok_per_s_per_gib"] else float("inf"))
+                         if p["tpm_k_tok_per_s_per_gib"] and b["tpm_k_tok_per_s_per_gib"]
+                         else float("inf"))
             print(f"\n[{regime}] PHOTON throughput: {speedup:.2f}x, "
                   f"KV memory reduction: {kv_ratio:.1f}x, TPM gain: {tpm_ratio:.1f}x")
 

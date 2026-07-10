@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 from model.baseline import BaselineLM, BaselineConfig
-from model.photon import PhotonLM, PhotonConfig, LevelConfig
+from model.photon import PhotonLM, PhotonConfig, LevelConfig, PHOTON_ARCH_VERSION
 from data import window_size, split_input_target
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
@@ -145,6 +145,9 @@ def main():
 
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)  # batch sampling; NumPy's global RNG is NOT seeded by torch.manual_seed
+    val_rng = np.random.default_rng(args.seed + 1)  # separate stream: periodic eval() calls
+    # must not perturb the training batch sequence, or two runs with the same
+    # --seed but different --eval_every would silently train on different data.
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     device = "cuda"
@@ -216,7 +219,7 @@ def main():
 
         if (step > 0 and step % args.eval_every == 0) or step == max_steps - 1:
             val_loss, val_token_loss = evaluate(train_model, val_arr, args.batch_size,
-                                                args.seq_len, device, args.arch, rng)
+                                                args.seq_len, device, args.arch, val_rng)
             val_ppl = math.exp(min(val_token_loss, 20))  # PPL from token loss ONLY
             print(f"[{args.run_name}] step {step} VAL loss={val_loss:.4f} "
                   f"token_loss={val_token_loss:.4f} ppl={val_ppl:.2f}")
@@ -226,7 +229,9 @@ def main():
 
     torch.save({"model_state": model.state_dict(), "cfg": cfg, "arch": args.arch,
                 "seq_len": args.seq_len, "run_name": args.run_name,
-                "train_args": vars(args)}, ckpt_path)
+                "train_args": vars(args),
+                "photon_arch_version": PHOTON_ARCH_VERSION if args.arch == "photon" else None},
+               ckpt_path)
     print(f"saved checkpoint to {ckpt_path}")
     log_f.close()
 

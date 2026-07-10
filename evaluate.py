@@ -11,7 +11,7 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 
 from model.baseline import BaselineLM, BaselineConfig
-from model.photon import PhotonLM, PhotonConfig
+from model.photon import PhotonLM, PhotonConfig, PHOTON_ARCH_VERSION
 from data import window_size, split_input_target
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
@@ -26,6 +26,17 @@ def load_model(ckpt_path, device="cuda", return_meta=False):
     if arch == "baseline":
         model = BaselineLM(cfg)
     else:
+        ckpt_version = ckpt.get("photon_arch_version")
+        if ckpt_version != PHOTON_ARCH_VERSION:
+            raise ValueError(
+                f"{ckpt_path} was saved with PHOTON arch version {ckpt_version!r} "
+                f"(None means a pre-versioning / v1 checkpoint), but the current code "
+                f"is version {PHOTON_ARCH_VERSION}. v1's non-recursive, teacher-forced "
+                f"forward pass is numerically incompatible with v2's recursive cascade "
+                f"despite matching parameter shapes -- loading would silently run v2 "
+                f"math on v1-trained weights and produce meaningless results. "
+                f"v1 checkpoints are kept only for the README's before/after numbers, "
+                f"already computed; they cannot be re-evaluated/generated from here.")
         model = PhotonLM(cfg)
     model.load_state_dict(ckpt["model_state"])
     model.to(device)
@@ -108,6 +119,9 @@ def main():
     if arch == "photon":
         total_c = cfg.total_downsample
         seq_len = (seq_len // total_c) * total_c
+        if seq_len == 0:
+            raise ValueError(f"--eval_seq_len {args.eval_seq_len} is smaller than this "
+                             f"checkpoint's total_downsample {total_c}; rounds down to 0")
 
     val_tokens = np.memmap(args.val_bin, dtype=np.uint16, mode="r")
     val_loss, val_ppl = perplexity_on_tokens(model, arch, val_tokens, seq_len, device, args.batch_size)

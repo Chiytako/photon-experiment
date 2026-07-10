@@ -52,28 +52,15 @@ def recon_cosine(model, idx):
 @torch.no_grad()
 def forced_continuation_loss(model, prompt, continuation, mode):
     """Average NLL/token of `continuation`, advancing the latent streams one
-    meta-context at a time exactly like PhotonLM._generate, but teacher-forced
-    on the ground-truth tokens instead of sampling. Works for any L."""
+    meta-context at a time via PhotonLM's own _prefill/_advance_streams (the
+    exact same primitives _generate uses), but teacher-forced on the
+    ground-truth tokens instead of sampling. Works for any L."""
     cfg = model.cfg
-    L = cfg.num_levels
     total_c = cfg.total_downsample
-    B = prompt.shape[0]
     assert prompt.shape[1] % total_c == 0
     assert continuation.shape[1] % total_c == 0
 
-    # prefill (same construction as PhotonLM._generate)
-    enc_kv = [model.encoders[i].new_kv_caches() for i in range(L)]
-    enc_states = [model.embed(prompt)]
-    cur = enc_states[0]
-    for i in range(L):
-        a = model.chunkers[i](cur)
-        cur = model.encoders[i](a, kv_caches=enc_kv[i])
-        enc_states.append(cur)
-    carry = {L: enc_states[L][:, -1, :]}
-    x_hat_prev = enc_states[L]
-    for i in reversed(range(1, L)):
-        x_hat_prev = model._decode_level(i, x_hat_prev)
-        carry[i] = x_hat_prev[:, -1, :]
+    enc_kv, carry = model._prefill(prompt)
 
     total_nll = 0.0
     n_tokens = 0
@@ -85,19 +72,7 @@ def forced_continuation_loss(model, prompt, continuation, mode):
         total_nll += F.cross_entropy(logits.reshape(-1, logits.size(-1)),
                                      true_mc.reshape(-1), reduction="sum").item()
         n_tokens += true_mc.numel()
-
-        if mode == "hiergen":
-            cur = model.embed(true_mc)
-            for i in range(L):
-                a = model.chunkers[i](cur)
-                cur = model.encoders[i](a, kv_caches=enc_kv[i])
-            carry[L] = cur[:, -1, :]
-        else:  # recgen
-            a_top = model.chunkers[L - 1](new[L - 1])
-            x_top = model.encoders[L - 1](a_top, kv_caches=enc_kv[L - 1])
-            carry[L] = x_top[:, -1, :]
-        for l in range(1, L):
-            carry[l] = new[l][:, -1, :]
+        model._advance_streams(carry, new, true_mc, enc_kv, recgen=(mode == "recgen"))
     return total_nll / n_tokens
 
 

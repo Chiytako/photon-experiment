@@ -129,7 +129,7 @@ def sample_token(logits: torch.Tensor, temperature: float = 1.0,
     """Temperature + top-k sampling shared by BaselineLM and PhotonLM.
     logits: (N, vocab). Returns (N, 1) sampled token ids."""
     logits = logits / max(temperature, 1e-5)
-    if top_k is not None:
+    if top_k:  # None or 0 both mean "no restriction"
         v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
         logits = logits.masked_fill(logits < v[:, [-1]], -float("inf"))
     probs = F.softmax(logits, dim=-1)

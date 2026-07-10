@@ -57,7 +57,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .transformer_blocks import TransformerStack, GradKVCache, sample_token
+from .transformer_blocks import TransformerStack, KVCache, GradKVCache, sample_token
+
+PHOTON_ARCH_VERSION = 2  # bump whenever the forward/generation dataflow changes incompatibly
 
 
 @dataclass
@@ -217,11 +219,17 @@ class PhotonLM(nn.Module):
         outputs -- no teacher forcing with true states, and sampled tokens
         never enter this trajectory.
 
-        Implemented incrementally with an autograd-safe KV cache, so each of
-        the R+C-1 window positions is processed exactly once (identical math
-        to re-running the growing prefix, ~3x less decoder compute)."""
+        Implemented incrementally with a KV cache, so each of the R+C-1
+        window positions is processed exactly once (identical math to
+        re-running the growing prefix, ~3x less decoder compute). Uses the
+        autograd-safe (concat-based) cache under grad -- training's
+        within-chunk recursion is differentiated through -- and the
+        preallocated slice-write cache otherwise (generation always runs
+        under @torch.no_grad(), so this is the common case for decode
+        throughput, including everything benchmark.py measures)."""
         C = self.cfg.levels[i].chunk_size
-        caches = [GradKVCache() for _ in self.decoders[i].layers]
+        cache_cls = GradKVCache if torch.is_grad_enabled() else KVCache
+        caches = [cache_cls() for _ in self.decoders[i].layers]
         h = self.decoders[i](U, kv_caches=caches)   # prefill; last output = X-hat_1
         outs = [h[:, -1:, :]]
         for _ in range(C - 1):
@@ -262,11 +270,12 @@ class PhotonLM(nn.Module):
 
         # --- recursive top-down decoder: X-hat^L := X^L, then descend on
         # reconstructions only (paper: X-hat^0 = D^1 o ... o D^L (X^L)) ---
+        want_recon = targets is not None and cfg.recon_loss_weight > 0
         recon_loss = x.new_zeros(())
         x_hat_prev = enc_states[-1]
         for i in reversed(range(cfg.num_levels)):
             x_hat = self._decode_level(i, x_hat_prev)
-            if targets is not None:
+            if want_recon:
                 # paper Eq. 1: position-averaged cosine distance, summed over
                 # levels. Targets detached (see module docstring).
                 cos = F.cosine_similarity(x_hat, enc_states[i].detach(), dim=-1)
@@ -281,7 +290,7 @@ class PhotonLM(nn.Module):
             token_loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)),
                                          targets.reshape(-1), ignore_index=-1)
             loss = token_loss
-            if cfg.recon_loss_weight > 0:
+            if want_recon:
                 loss = loss + cfg.recon_loss_weight * recon_loss
             parts = {"token_loss": token_loss, "recon_loss": recon_loss}
         if return_parts:
@@ -330,33 +339,65 @@ class PhotonLM(nn.Module):
             upper = xh
         return new
 
-    @torch.no_grad()
-    def _generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float,
-                  top_k: Optional[int], recgen: bool) -> torch.Tensor:
-        cfg = self.cfg
-        L = cfg.num_levels
-        total_c = cfg.total_downsample
-        idx = self._align_prompt(idx)
-        B = idx.shape[0]
+    def _prefill(self, idx: torch.Tensor):
+        """One-time hierarchical prefill over an aligned prompt: bottom-up
+        encode (building the encoder KV streams) then the training-style
+        cascade down to level 1 to seed the cross-boundary carry latents.
+        Shared by _generate and scripts/recgen_diag.py's forced-decoding
+        diagnostics, so both always run exactly this computation.
 
-        # --- one-time hierarchical prefill: bottom-up over the prompt,
-        # building the encoder KV streams ---
+        Returns (enc_kv, carry) where carry[L] is the latest top-level
+        latent and carry[l] (1<=l<L) is the last X-hat^l of the prompt
+        (level-0 reconstructions are never a conditioning source, so they
+        are not part of the carry)."""
+        L = self.cfg.num_levels
         enc_kv = [self.encoders[i].new_kv_caches() for i in range(L)]
-        enc_states = [self.embed(idx)]
-        cur = enc_states[0]
+        cur = self.embed(idx)
+        enc_states = [cur]
         for i in range(L):
             a = self.chunkers[i](cur)
             cur = self.encoders[i](a, kv_caches=enc_kv[i])
             enc_states.append(cur)
 
-        # carry[L] = latest top latent; carry[l] (1<=l<L) = last X-hat^l of the
-        # prompt, from the training-style cascade run down to level 1 (level-0
-        # reconstructions are never a conditioning source, so we skip them).
         carry: Dict[int, torch.Tensor] = {L: enc_states[L][:, -1, :]}
         x_hat_prev = enc_states[L]
         for i in reversed(range(1, L)):
             x_hat_prev = self._decode_level(i, x_hat_prev)
             carry[i] = x_hat_prev[:, -1, :]
+        return enc_kv, carry
+
+    def _advance_streams(self, carry: Dict[int, torch.Tensor], new: Dict[int, torch.Tensor],
+                         tokens: torch.Tensor, enc_kv, recgen: bool) -> None:
+        """Advance `carry` in place past one completed meta-context.
+        `tokens`: (B, total_c) the meta-context's token ids -- sampled during
+        generation, or ground truth during forced-decoding diagnostics; the
+        state-advance math doesn't care which. Shared by _generate and
+        scripts/recgen_diag.py."""
+        L = self.cfg.num_levels
+        if recgen:
+            # Def. A.3: summary from decoder-side reconstructions; only the
+            # top-level encoder stream advances.
+            a_top = self.chunkers[L - 1](new[L - 1])                  # (B, 1, D_L)
+            x_top = self.encoders[L - 1](a_top, kv_caches=enc_kv[L - 1])
+            carry[L] = x_top[:, -1, :]
+        else:
+            # Def. A.2 (HierGen): re-encode tokens bottom-up; every encoder
+            # KV stream advances.
+            cur = self.embed(tokens)
+            for i in range(L):
+                a = self.chunkers[i](cur)
+                cur = self.encoders[i](a, kv_caches=enc_kv[i])
+            carry[L] = cur[:, -1, :]
+        for l in range(1, L):
+            carry[l] = new[l][:, -1, :]
+
+    @torch.no_grad()
+    def _generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float,
+                  top_k: Optional[int], recgen: bool) -> torch.Tensor:
+        total_c = self.cfg.total_downsample
+        idx = self._align_prompt(idx)
+        B = idx.shape[0]
+        enc_kv, carry = self._prefill(idx)
 
         out_chunks = [idx]
         generated = 0
@@ -370,23 +411,7 @@ class PhotonLM(nn.Module):
             generated += n_take
             if n_take < total_c:
                 break  # partial final meta-context: no state advance needed
-
-            if recgen:
-                # Def. A.3: summary from decoder-side reconstructions; only
-                # the top-level encoder stream advances.
-                a_top = self.chunkers[L - 1](new[L - 1])              # (B, 1, D_L)
-                x_top = self.encoders[L - 1](a_top, kv_caches=enc_kv[L - 1])
-                carry[L] = x_top[:, -1, :]
-            else:
-                # Def. A.2 (HierGen): re-encode sampled tokens bottom-up;
-                # every encoder KV stream advances.
-                cur = self.embed(toks)
-                for i in range(L):
-                    a = self.chunkers[i](cur)
-                    cur = self.encoders[i](a, kv_caches=enc_kv[i])
-                carry[L] = cur[:, -1, :]
-            for l in range(1, L):
-                carry[l] = new[l][:, -1, :]
+            self._advance_streams(carry, new, toks, enc_kv, recgen)
         return torch.cat(out_chunks, dim=1)
 
     @torch.no_grad()
