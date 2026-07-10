@@ -1,0 +1,11 @@
+{
+  "ckpt": "checkpoints/photon2_a03.pt",
+  "recon_cosine": {
+    "level1": 0.9509950280189514,
+    "level0": 0.048748407512903214
+  },
+  "hiergen_nll": 7.062960654497147,
+  "recgen_nll": 7.175830915570259,
+  "hiergen_ppl": 1167.89779408731,
+  "recgen_ppl": 1307.446027031789
+}

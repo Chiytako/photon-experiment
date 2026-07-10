@@ -12,6 +12,7 @@ from transformers import AutoTokenizer
 
 from model.baseline import BaselineLM, BaselineConfig
 from model.photon import PhotonLM, PhotonConfig
+from data import window_size, split_input_target
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 CKPT_DIR = os.path.join(os.path.dirname(__file__), "checkpoints")
@@ -30,35 +31,37 @@ def load_model(ckpt_path, device="cuda", return_meta=False):
     model.to(device)
     model.eval()
     if return_meta:
-        meta = {"run_name": ckpt.get("run_name", arch), "seq_len": ckpt["seq_len"]}
+        meta = {"run_name": ckpt.get("run_name", arch), "seq_len": ckpt["seq_len"],
+                "train_args": ckpt.get("train_args", {})}
         return model, arch, cfg, ckpt["seq_len"], meta
     return model, arch, cfg, ckpt["seq_len"]
 
 
 @torch.no_grad()
 def perplexity_on_tokens(model, arch, tokens: np.ndarray, seq_len: int, device, batch_size=8, stride=None):
-    """Non-overlapping (or strided) windows, loss averaged over all predicted
-    tokens (token-count-weighted, standard PPL convention)."""
+    """Non-overlapping (or strided) windows, TOKEN loss averaged over all
+    predicted tokens (token-count-weighted, standard PPL convention). Uses the
+    token-only component of the loss: for PHOTON with alpha>0 the combined
+    training loss also contains the reconstruction term, which must never
+    leak into a reported perplexity."""
     if stride is None:
         stride = seq_len
     total_loss = 0.0
     total_count = 0
     n = len(tokens)
-    starts = list(range(0, n - seq_len - 1, stride))
+    win = window_size(seq_len, arch)
+    starts = list(range(0, n - win + 1, stride))
+    if not starts:
+        raise ValueError(f"not enough eval data: {n} tokens < window {win}")
     for i in range(0, len(starts), batch_size):
         batch_starts = starts[i:i + batch_size]
-        if arch == "baseline":
-            chunk = np.stack([tokens[s:s + seq_len + 1] for s in batch_starts]).astype(np.int64)
-            chunk = torch.from_numpy(chunk).to(device)
-            x, y = chunk[:, :-1], chunk[:, 1:]
-        else:
-            chunk = np.stack([tokens[s:s + seq_len] for s in batch_starts]).astype(np.int64)
-            chunk = torch.from_numpy(chunk).to(device)
-            x, y = chunk, chunk
+        chunk = np.stack([tokens[s:s + win] for s in batch_starts]).astype(np.int64)
+        chunk = torch.from_numpy(chunk).to(device)
+        x, y = split_input_target(chunk, arch)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            _, loss = model(x, y)
-        n_tok = x.numel()
-        total_loss += loss.item() * n_tok
+            _, _, parts = model(x, y, return_parts=True)
+        n_tok = y.numel()
+        total_loss += parts["token_loss"].item() * n_tok
         total_count += n_tok
     avg_loss = total_loss / total_count
     return avg_loss, math.exp(min(avg_loss, 20))
@@ -76,15 +79,28 @@ def main():
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--eval_seq_len", type=int, default=1024)
     ap.add_argument("--batch_size", type=int, default=8)
-    ap.add_argument("--val_bin", default=os.path.join(DATA_DIR, "val.bin"),
-                     help="Held-out FineWeb bin to evaluate on. Models trained on "
-                          "the 2.2B-token set must use data2b/val.bin -- the "
-                          "original data/val.bin overlaps that training stream.")
+    ap.add_argument("--val_bin", default=None,
+                     help="Held-out FineWeb bin to evaluate on. Default: resolved "
+                          "from the checkpoint's own train_args.data_dir, so a "
+                          "model trained on data2b/ is automatically evaluated on "
+                          "data2b/val.bin (the original data/val.bin overlaps that "
+                          "training stream). Pass explicitly to override.")
     args = ap.parse_args()
 
     device = "cuda"
     model, arch, cfg, train_seq_len, meta = load_model(args.ckpt, device, return_meta=True)
     run_name = meta["run_name"]
+
+    if args.val_bin is None:
+        train_data_dir = meta.get("train_args", {}).get("data_dir", DATA_DIR)
+        args.val_bin = os.path.join(train_data_dir, "val.bin")
+        print(f"--val_bin not given; using the checkpoint's training data_dir: {args.val_bin}")
+    else:
+        ckpt_dir = meta.get("train_args", {}).get("data_dir")
+        if ckpt_dir and os.path.abspath(os.path.dirname(args.val_bin)) != os.path.abspath(ckpt_dir):
+            print(f"WARNING: --val_bin {args.val_bin} differs from the checkpoint's "
+                  f"training data_dir {ckpt_dir}; make sure this is intentional "
+                  f"(train/val overlap yields misleadingly good perplexity).")
     n_params = model.num_params()
     print(f"loaded {run_name} ({arch}) checkpoint ({n_params/1e6:.2f}M params)")
 

@@ -1,59 +1,63 @@
 """PHOTON: Parallel Hierarchical Operation for TOp-down Networks.
 
-Re-implementation from Fujitsu et al., arXiv:2512.20687 ("PHOTON: Hierarchical
-Autoregressive Modeling for Lightspeed and Memory-Efficient Language
-Generation"). No official code was released at the time of writing; this is a
-from-scratch reimplementation based on the paper's described architecture.
+Faithful re-implementation of Ichikawa et al. (Fujitsu), arXiv:2512.20687
+("PHOTON: Hierarchical Autoregressive Modeling for Lightspeed and
+Memory-Efficient Language Generation"). No official code was released at the
+time of writing; this follows the paper's equations (Sec. 2, Appendix A).
 
-Design (L levels above the raw token sequence, default L=2):
+Architecture (L levels above the raw token sequence, default L=2):
 
-Bottom-up encoder (per level l, causal):
+Bottom-up encoder (per level l, causal; Sec. 2.1.1):
   A^l = ContextChunker_l(X^{l-1})   # concat C_l vectors -> linear -> 1 vector
   X^l = ContextEncoder_l(A^l)       # causal transformer over the M_l-length seq
 
-Top-down decoder (per level l, from L down to 1):
-  U^l = ContextConverter_l(shift(X^l))     # 1 latent -> R_l prefix vectors
-                                            # (ConvTranspose1d, kernel=stride=R_l)
-  own_shift^{l-1}_chunk = [ U^l[-1] , X^{l-1}_chunk[:-1] ]   # local shift-by-1
-  dec_in = concat[ U^l , own_shift^{l-1}_chunk ]             # length R_l + C_l
-  X_hat^{l-1}_chunk = ContextDecoder_l(dec_in)[-C_l:]        # local causal attn
+Top-down decoder (per level l, from L down to 1; Sec. 2.1.2) -- RECURSIVE:
+  X-hat^L := X^L                       # only the top level sees encoder states
+  U^l_{g-1} = Converter_l(X-hat^l_{g-1})           # 1 latent -> R_l prefix vecs
+  X-hat^{l-1}_{I_g, j} = Decoder_l([U^l_{g-1}; X-hat^{l-1}_{I_g, <j}])
+                                                   # within-chunk LATENT recursion
+so that  X-hat^0 = D^1 o ... o D^L o E^L o ... o E^1 (X^0).
 
-X_hat^0 -> lm_head -> logits, trained with cross-entropy directly against the
-token ids at the same (unshifted) positions, since the causal shift is already
-baked into the local decoder's input construction (position i's output only
-had access to strictly-prior information).
+Two properties of this design that differ from a standard causal LM:
+  * Each level-(l-1) chunk g is conditioned only on the PREVIOUS level-l latent
+    (shift at level l), so token positions inside one meta-context (C_{<=L}
+    consecutive tokens) never see each other: given the top-level history,
+    the tokens of a meta-context are conditionally INDEPENDENT. Sampled tokens
+    do not feed back into the latent trajectory; the trajectory is a
+    deterministic function of the top-level stream.
+  * Every decoder attends within a bounded local window of R_l + C_l - 1
+    positions, independent of T. Only the encoder streams grow with T.
 
-Only the TOP level's ContextEncoder does full (compressed-length M_L) causal
-attention; every decoder does BOUNDED local attention over a fixed window
-R_l + C_l, independent of the global sequence length T. This is the source of
-PHOTON's claimed efficiency gains.
+X-hat^0 -> lm_head -> logits, trained with cross-entropy against the token ids
+at the same (unshifted) positions: X-hat^0_j is the model's reconstruction of
+embedding(t_j) built from strictly-prior information, so its logits predict
+t_j itself (the causal shift is baked into the converter conditioning).
 
-An optional recursive reconstruction loss (cosine distance between each
-decoder's X_hat^{l-1} and the encoder's true X^{l-1}, weight alpha) trains the
-decoders to approximate the encoder so that "RecGen" inference can later skip
-bottom-up re-encoding. The paper's main results use alpha=0; we default to 0
-too but support turning it on.
+Optional recursive reconstruction loss (paper Eq. 1): cosine distance between
+each decoder reconstruction X-hat^{l-1} and the encoder's true X^{l-1},
+position-averaged, summed over levels, weight alpha (paper's main results use
+alpha=0; Appendix B.1 finds alpha ~= 0.3 best for zero-shot quality).
+Deviation noted in README: we detach the encoder targets (the paper does not
+specify stop-gradient placement).
 
-Generation (HierGen): sequential over level-1 chunks of C_1 tokens. Within a
-chunk, tokens are sampled one at a time via ContextDecoder_1's small
-(R_1+C_1)-window KV cache. After a chunk completes, its tokens are re-encoded
-bottom-up (ContextChunker_1 -> ContextEncoder_1, incrementally via KV cache)
-to refresh the true X^1 state; every C_2 level-1 chunks, X^2 is similarly
-refreshed. This bottom-up re-encoding after each chunk is what "Hier" in
-HierGen refers to (contrasted with "RecGen", which skips it and reuses the
-decoders' own reconstructions -- not implemented here, since alpha=0 by
-default makes that substitution unreliable).
+Generation (paper Sec. 2.3 / Appendix A): one meta-context (C_{<=L} tokens)
+per top-level step, decoded by the same recursive cascade as training.
+  * HierGen (Def. A.2): after sampling a meta-context, re-encode its tokens
+    bottom-up (all encoder KV streams advance).
+  * RecGen (Def. A.3): skip re-encoding; summarize the decoder-side
+    reconstructions X-hat^{L-1} with the top chunker and advance ONLY the
+    top-level encoder stream. Global KV drops to the top level alone.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .transformer_blocks import TransformerStack, KVCache
+from .transformer_blocks import TransformerStack, GradKVCache, sample_token
 
 
 @dataclass
@@ -72,12 +76,12 @@ class LevelConfig:
 @dataclass
 class PhotonConfig:
     vocab_size: int = 32000
-    d0: int = 256
+    d0: int = 512
     levels: List[LevelConfig] = field(default_factory=lambda: [
-        LevelConfig(chunk_size=4, dim=384, prefix_len=4, enc_layers=2, enc_heads=6,
-                    enc_mlp_hidden=1024, dec_layers=2, dec_heads=6, dec_mlp_hidden=1024),
-        LevelConfig(chunk_size=4, dim=448, prefix_len=4, enc_layers=2, enc_heads=7,
-                    enc_mlp_hidden=1152, dec_layers=2, dec_heads=7, dec_mlp_hidden=1152),
+        LevelConfig(chunk_size=4, dim=512, prefix_len=4, enc_layers=2, enc_heads=8,
+                    enc_mlp_hidden=1536, dec_layers=2, dec_heads=8, dec_mlp_hidden=1536),
+        LevelConfig(chunk_size=4, dim=512, prefix_len=4, enc_layers=2, enc_heads=8,
+                    enc_mlp_hidden=1536, dec_layers=2, dec_heads=8, dec_mlp_hidden=1536),
     ])
     max_seq_len: int = 2048
     recon_loss_weight: float = 0.0  # alpha; paper's main results use 0.0
@@ -129,10 +133,6 @@ class ContextConverter(nn.Module):
         y = y.transpose(1, 2).reshape(B, M, self.prefix_len, self.out_dim)
         return y
 
-    def forward_one(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, in_dim) single latent -> (B, prefix_len, out_dim); used in generation.
-        return self.forward(x.unsqueeze(1)).squeeze(1)
-
 
 def _shift_with_start(x: torch.Tensor, start: torch.Tensor) -> torch.Tensor:
     """x: (B, M, D). Returns sequence where position 0 = start, position i = x[i-1]."""
@@ -162,12 +162,15 @@ class PhotonLM(nn.Module):
             ContextConverter(dims[i + 1], dims[i], cfg.levels[i].prefix_len)
             for i in range(cfg.num_levels)
         ])
+        # local decoder window: [U (R_l); X-hat_{<j} (C_l - 1)] -> R_l + C_l - 1
         self.decoders = nn.ModuleList([
             TransformerStack(cfg.levels[i].dec_layers, dims[i], cfg.levels[i].dec_heads,
                               cfg.levels[i].dec_mlp_hidden,
                               max_seq_len=cfg.levels[i].prefix_len + cfg.levels[i].chunk_size)
             for i in range(cfg.num_levels)
         ])
+        # learned starting latents X-hat^l_0 (paper Sec. 2.1.2), one per level l=1..L,
+        # used as the conditioning "previous latent" of the very first chunk.
         self.start_vecs = nn.ParameterList([
             nn.Parameter(torch.zeros(cfg.levels[i].dim)) for i in range(cfg.num_levels)
         ])
@@ -177,6 +180,13 @@ class PhotonLM(nn.Module):
             self.lm_head.weight = self.embed.weight
 
         self.apply(self._init_weights)
+        # start_vecs must NOT be zeros: an exactly-zero start latent makes the
+        # first chunk's converter prefix exactly zero, the zero activations
+        # propagate through the recursive cascade, and RMSNorm's backward at
+        # zero input scales gradients by rsqrt(eps) ~ 316 per crossing --
+        # compounding to inf and silently zeroing every step via grad clipping.
+        for p in self.start_vecs:
+            nn.init.normal_(p, mean=0.0, std=0.02)
 
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.ConvTranspose1d)):
@@ -193,9 +203,48 @@ class PhotonLM(nn.Module):
         return n
 
     # ---------------------------------------------------------------
-    # Training forward: fully parallel, teacher-forced at every level.
+    # Shared decoding primitives (used by forward, generation, tests,
+    # and diagnostics -- there is exactly one implementation of the
+    # top-down math).
     # ---------------------------------------------------------------
-    def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None):
+    def _decode_chunks(self, i: int, U: torch.Tensor) -> torch.Tensor:
+        """Within-chunk latent recursion (paper Sec. 2.1.2).
+
+        U: (N, R_i, D_i) converter prefixes, one row per chunk. Decodes the
+        C_i chunk latents sequentially: X-hat_j is the last-position output of
+        a causal pass over [U; X-hat_1..X-hat_{j-1}] (the paper's mask M_{R,j}
+        of size (R+j-1) x (R+j-1)). The recursion is over the decoder's own
+        outputs -- no teacher forcing with true states, and sampled tokens
+        never enter this trajectory.
+
+        Implemented incrementally with an autograd-safe KV cache, so each of
+        the R+C-1 window positions is processed exactly once (identical math
+        to re-running the growing prefix, ~3x less decoder compute)."""
+        C = self.cfg.levels[i].chunk_size
+        caches = [GradKVCache() for _ in self.decoders[i].layers]
+        h = self.decoders[i](U, kv_caches=caches)   # prefill; last output = X-hat_1
+        outs = [h[:, -1:, :]]
+        for _ in range(C - 1):
+            h = self.decoders[i](outs[-1], kv_caches=caches)
+            outs.append(h[:, -1:, :])
+        return torch.cat(outs, dim=1)               # (N, C_i, D_i)
+
+    def _decode_level(self, i: int, source: torch.Tensor) -> torch.Tensor:
+        """One full top-down level over a whole latent stream (training-style,
+        parallel across chunks). source: (B, M, D_{i+1}) = X-hat^{i+1}
+        (or X^{L} at the top). Returns X-hat^{i}: (B, M*C_i, D_i)."""
+        shifted = _shift_with_start(source, self.start_vecs[i])
+        U = self.converters[i](shifted)          # (B, M, R_i, D_i)
+        B, M, R, D = U.shape
+        xh = self._decode_chunks(i, U.reshape(B * M, R, D))
+        return xh.reshape(B, M * self.cfg.levels[i].chunk_size, D)
+
+    # ---------------------------------------------------------------
+    # Training forward: recursive top-down cascade, parallel across
+    # chunks; within-chunk recursion is C_l cheap bounded-window steps.
+    # ---------------------------------------------------------------
+    def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None,
+                return_parts: bool = False):
         cfg = self.cfg
         B, T = idx.shape
         total_c = cfg.total_downsample
@@ -211,242 +260,143 @@ class PhotonLM(nn.Module):
             enc_states.append(xi)
         # enc_states[i] = X^i for i=0..L (X^0 = token embeddings)
 
-        # --- top-down decoder ---
+        # --- recursive top-down decoder: X-hat^L := X^L, then descend on
+        # reconstructions only (paper: X-hat^0 = D^1 o ... o D^L (X^L)) ---
         recon_loss = x.new_zeros(())
-        n_recon = 0
-        x_hat_prev = None  # will hold X_hat^{l} while descending
+        x_hat_prev = enc_states[-1]
         for i in reversed(range(cfg.num_levels)):
-            C = cfg.levels[i].chunk_size
-            R = cfg.levels[i].prefix_len
-            own_dim = enc_states[i].shape[-1]
-
-            source_l = enc_states[i + 1]  # true encoder X^{l}; used for both HierGen & training
-            shifted = _shift_with_start(source_l, self.start_vecs[i])
-            U = self.converters[i](shifted)  # (B, M_l, R, own_dim)
-
-            own = enc_states[i]  # (B, M_{l-1}, own_dim) == (B, M_l * C, own_dim)
-            Bsz, Mlm1, _ = own.shape
-            Ml = Mlm1 // C
-            own_chunks = own.reshape(Bsz, Ml, C, own_dim)
-            own_shift = torch.cat([U[:, :, -1:, :], own_chunks[:, :, :-1, :]], dim=2)  # (B,Ml,C,own_dim)
-
-            dec_in = torch.cat([U, own_shift], dim=2)  # (B, Ml, R+C, own_dim)
-            dec_in_flat = dec_in.reshape(Bsz * Ml, R + C, own_dim)
-            dec_out = self.decoders[i](dec_in_flat)
-            x_hat_chunk = dec_out[:, R:, :]  # (B*Ml, C, own_dim)
-            x_hat = x_hat_chunk.reshape(Bsz, Ml, C, own_dim).reshape(Bsz, Mlm1, own_dim)
-
-            if cfg.recon_loss_weight > 0:
-                target_states = enc_states[i].detach()
-                cos = F.cosine_similarity(x_hat, target_states, dim=-1)
+            x_hat = self._decode_level(i, x_hat_prev)
+            if targets is not None:
+                # paper Eq. 1: position-averaged cosine distance, summed over
+                # levels. Targets detached (see module docstring).
+                cos = F.cosine_similarity(x_hat, enc_states[i].detach(), dim=-1)
                 recon_loss = recon_loss + (1.0 - cos).mean()
-                n_recon += 1
-
             x_hat_prev = x_hat
 
-        x0_hat = x_hat_prev  # (B, T, D0)
-        logits = self.lm_head(x0_hat)
+        logits = self.lm_head(x_hat_prev)  # (B, T, V) from X-hat^0
 
         loss = None
+        parts = None
         if targets is not None:
-            token_loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+            token_loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)),
+                                         targets.reshape(-1), ignore_index=-1)
             loss = token_loss
-            if cfg.recon_loss_weight > 0 and n_recon > 0:
-                loss = loss + cfg.recon_loss_weight * (recon_loss / n_recon)
+            if cfg.recon_loss_weight > 0:
+                loss = loss + cfg.recon_loss_weight * recon_loss
+            parts = {"token_loss": token_loss, "recon_loss": recon_loss}
+        if return_parts:
+            return logits, loss, parts
         return logits, loss
 
     # ---------------------------------------------------------------
-    # HierGen inference: sequential chunk-by-chunk generation with KV
-    # caching at the encoder levels and small local decoder windows.
+    # Generation: one meta-context (C_{<=L} tokens) per top-level step,
+    # decoded by the same recursive cascade as training.
     # ---------------------------------------------------------------
-    @torch.no_grad()
-    def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0,
-                 top_k: Optional[int] = None):
-        cfg = self.cfg
-        device = idx.device
-        B = idx.shape[0]
-        total_c = cfg.total_downsample
-        prompt_len = idx.shape[1]
-        excess = prompt_len % total_c
+    def _align_prompt(self, idx: torch.Tensor) -> torch.Tensor:
+        total_c = self.cfg.total_downsample
+        excess = idx.shape[1] % total_c
         if excess > 0:
             # left-truncate down to a multiple of total_c (keeps most recent context)
             idx = idx[:, excess:]
-            prompt_len = idx.shape[1]
-        assert prompt_len >= total_c, "prompt too short for chunking configuration"
+        assert idx.shape[1] >= total_c, "prompt too short for chunking configuration"
+        return idx
 
-        tokens = idx.clone()
-        x0_hist = self.embed(tokens)  # (B, T, D0) running embedding history
+    def _decode_meta_context(self, carry: Dict[int, torch.Tensor]) -> Dict[int, torch.Tensor]:
+        """Decode all latents of the next meta-context top-down.
 
-        # --- prefill encoder hierarchy over the prompt, building KV caches ---
-        enc_kv = [self.encoders[i].new_kv_caches() for i in range(cfg.num_levels)]
-        enc_hist = [x0_hist]
-        cur = x0_hist
-        for i in range(cfg.num_levels):
-            a = self.chunkers[i](cur)
-            xi = self.encoders[i](a, kv_caches=enc_kv[i])
-            enc_hist.append(xi)
-            cur = xi
-        # enc_hist[i]: (B, M_i, D_i) full history so far, one entry per level
+        carry[L]: (B, D_L) latest top-level encoder latent X^L_g.
+        carry[l] (1 <= l < L): (B, D_l) last X-hat^l of the previous
+        meta-context (the cross-boundary conditioning latent).
 
-        counters = [0] * cfg.num_levels  # counts new level-(i-1) items accumulated toward next level-i chunk
+        Returns {level: (B, n_l, D_l)} with n_l = prod_{k>l} C_k new latents;
+        new[0] holds the total_c token-level reconstructions.
 
-        C0 = cfg.levels[0].chunk_size
-        generated_total = 0
-        while generated_total < max_new_tokens:
-            n_new = min(C0, max_new_tokens - generated_total)
-            # Build the R_0 prefix from the most recent (shifted) level-1 latent.
-            if enc_hist[1].shape[1] > 0:
-                latest_x1 = enc_hist[1][:, -1, :]
+        Chunk g at level l is conditioned on latent g-1 at level l+1, exactly
+        as in the training shift: the conditioning stream for level l is
+        [carry[l+1], new[l+1][0], ..., new[l+1][n-2]]."""
+        L = self.cfg.num_levels
+        new: Dict[int, torch.Tensor] = {}
+        upper: Optional[torch.Tensor] = None
+        for i in reversed(range(L)):
+            if upper is None:
+                cond = carry[i + 1].unsqueeze(1)                      # (B, 1, D_{i+1})
             else:
-                latest_x1 = self.start_vecs[0].unsqueeze(0).expand(idx.shape[0], -1)
-            new_tokens_chunk = self._sample_chunk_tokens(latest_x1, n_new, temperature, top_k)
-            tokens = torch.cat([tokens, new_tokens_chunk], dim=1)
-            new_emb = self.embed(new_tokens_chunk)
-            x0_hist = torch.cat([x0_hist, new_emb], dim=1)
-            generated_total += n_new
+                cond = torch.cat([carry[i + 1].unsqueeze(1), upper[:, :-1, :]], dim=1)
+            U = self.converters[i](cond)                              # (B, n, R, D_i)
+            B, n, R, D = U.shape
+            xh = self._decode_chunks(i, U.reshape(B * n, R, D))
+            xh = xh.reshape(B, n * self.cfg.levels[i].chunk_size, D)
+            new[i] = xh
+            upper = xh
+        return new
 
-            if n_new == C0:
-                # refresh encoder hierarchy bottom-up incrementally (HierGen re-encoding)
-                a0 = self.chunkers[0](x0_hist[:, -C0:, :])  # (B,1,D1)
-                x1_new = self.encoders[0](a0, kv_caches=enc_kv[0])
-                enc_hist[1] = torch.cat([enc_hist[1], x1_new], dim=1)
-                counters[0] += 1
-                cur_new = x1_new
-                for i in range(1, cfg.num_levels):
-                    C_i = cfg.levels[i].chunk_size
-                    if counters[i - 1] % C_i == 0:
-                        recent = enc_hist[i][:, -C_i:, :]
-                        a_i = self.chunkers[i](recent)
-                        x_next = self.encoders[i](a_i, kv_caches=enc_kv[i])
-                        enc_hist[i + 1] = torch.cat([enc_hist[i + 1], x_next], dim=1)
-                        counters[i] += 1
-                    else:
-                        break
-        return tokens
-
-    def _sample_chunk_tokens(self, latest_x1, n_new, temperature, top_k):
-        """Generate up to C_0 new tokens using the bounded local decoder-0 window,
-        conditioned on `latest_x1`: the latent of the most recent COMPLETED
-        level-1 chunk. In HierGen this is the true encoder state X^1 (latest
-        entry of enc_hist[1], matching the training forward exactly); in RecGen
-        it is the level-1 decoder-side reconstruction X-hat^1.
-        """
+    @torch.no_grad()
+    def _generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float,
+                  top_k: Optional[int], recgen: bool) -> torch.Tensor:
         cfg = self.cfg
-        U0 = self.converters[0].forward_one(latest_x1)  # (B, R_0, D0)
+        L = cfg.num_levels
+        total_c = cfg.total_downsample
+        idx = self._align_prompt(idx)
+        B = idx.shape[0]
 
-        C0 = cfg.levels[0].chunk_size
-        R0 = cfg.levels[0].prefix_len
-        kv = self.decoders[0].new_kv_caches()
-        self.decoders[0](U0, kv_caches=kv)  # prefill prefix positions 0..R0-1 (output unused)
-        # own_shift[0] duplicates the prefix's last vector (mirrors training's
-        # own_shift construction, which has no true "previous token" at the
-        # start of a chunk); this is position R0, whose output predicts token 0.
-        dup = U0[:, -1:, :]
-        h = self.decoders[0](dup, kv_caches=kv)
-        logits = self.lm_head(h)
+        # --- one-time hierarchical prefill: bottom-up over the prompt,
+        # building the encoder KV streams ---
+        enc_kv = [self.encoders[i].new_kv_caches() for i in range(L)]
+        enc_states = [self.embed(idx)]
+        cur = enc_states[0]
+        for i in range(L):
+            a = self.chunkers[i](cur)
+            cur = self.encoders[i](a, kv_caches=enc_kv[i])
+            enc_states.append(cur)
 
-        new_tokens = []
-        for step in range(n_new):
-            step_logits = logits[:, -1, :] / max(temperature, 1e-5)
-            if top_k is not None:
-                v, _ = torch.topk(step_logits, min(top_k, step_logits.size(-1)))
-                step_logits = step_logits.masked_fill(step_logits < v[:, [-1]], -float('inf'))
-            probs = F.softmax(step_logits, dim=-1)
-            next_tok = torch.multinomial(probs, num_samples=1)
-            new_tokens.append(next_tok)
-            if step < n_new - 1:
-                emb = self.embed(next_tok)  # (B,1,D0); becomes own_shift[step+1]
-                h = self.decoders[0](emb, kv_caches=kv)
-                logits = self.lm_head(h)
-        return torch.cat(new_tokens, dim=1)
+        # carry[L] = latest top latent; carry[l] (1<=l<L) = last X-hat^l of the
+        # prompt, from the training-style cascade run down to level 1 (level-0
+        # reconstructions are never a conditioning source, so we skip them).
+        carry: Dict[int, torch.Tensor] = {L: enc_states[L][:, -1, :]}
+        x_hat_prev = enc_states[L]
+        for i in reversed(range(1, L)):
+            x_hat_prev = self._decode_level(i, x_hat_prev)
+            carry[i] = x_hat_prev[:, -1, :]
 
-    # ---------------------------------------------------------------
-    # RecGen inference: like HierGen, but after prefill the level-0
-    # encoder is never called again. The X^1 latent stream is instead
-    # continued by the level-1 DECODER's recursive reconstructions
-    # (X-hat^1), and the top-level X^2 state is refreshed from those
-    # reconstructions. Only the top-level encoder KV grows with T:
-    # global KV storage drops from O(T/C1)+O(T/C1C2) to O(T/C1C2).
-    #
-    # Design notes (the paper describes RecGen only at a high level; the
-    # following choices are ours, mirroring the training dataflow):
-    # - X-hat^1_k is produced by decoders[1] exactly as in training:
-    #   within each level-2 chunk, a local KV window over
-    #   [U^1 (from converters[1] on the latest X^2); previous X-hat^1s],
-    #   with the training-time "dup" trick at the chunk start.
-    # - Consequence: within a level-2 chunk (C1*C2 tokens), the latent
-    #   trajectory is predicted open-loop by the top-down pathway -- the
-    #   sampled tokens do not feed back into it (they only condition the
-    #   token-level decoder within their own chunk). This is the price of
-    #   skipping re-encoding; the reconstruction loss (alpha>0) trains
-    #   X-hat^1 to track the true X^1, making the approximation viable.
-    # - X^2 is refreshed every C1*C2 tokens by chunkers[1]+encoders[1]
-    #   applied to the C2 accumulated X-hat^1 latents (encoder-side input
-    #   is the reconstruction, not the true X^1 -- again the RecGen trade).
-    # ---------------------------------------------------------------
+        out_chunks = [idx]
+        generated = 0
+        while generated < max_new_tokens:
+            new = self._decode_meta_context(carry)
+            logits = self.lm_head(new[0])                             # (B, total_c, V)
+            toks = sample_token(logits.reshape(B * total_c, -1),
+                                temperature, top_k).view(B, total_c)
+            n_take = min(total_c, max_new_tokens - generated)
+            out_chunks.append(toks[:, :n_take])
+            generated += n_take
+            if n_take < total_c:
+                break  # partial final meta-context: no state advance needed
+
+            if recgen:
+                # Def. A.3: summary from decoder-side reconstructions; only
+                # the top-level encoder stream advances.
+                a_top = self.chunkers[L - 1](new[L - 1])              # (B, 1, D_L)
+                x_top = self.encoders[L - 1](a_top, kv_caches=enc_kv[L - 1])
+                carry[L] = x_top[:, -1, :]
+            else:
+                # Def. A.2 (HierGen): re-encode sampled tokens bottom-up;
+                # every encoder KV stream advances.
+                cur = self.embed(toks)
+                for i in range(L):
+                    a = self.chunkers[i](cur)
+                    cur = self.encoders[i](a, kv_caches=enc_kv[i])
+                carry[L] = cur[:, -1, :]
+            for l in range(1, L):
+                carry[l] = new[l][:, -1, :]
+        return torch.cat(out_chunks, dim=1)
+
+    @torch.no_grad()
+    def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0,
+                 top_k: Optional[int] = None) -> torch.Tensor:
+        """HierGen (paper Def. A.2)."""
+        return self._generate(idx, max_new_tokens, temperature, top_k, recgen=False)
+
     @torch.no_grad()
     def generate_recgen(self, idx: torch.Tensor, max_new_tokens: int,
-                         temperature: float = 1.0, top_k: Optional[int] = None):
-        cfg = self.cfg
-        assert cfg.num_levels == 2, "RecGen implemented for L=2 hierarchies"
-        B = idx.shape[0]
-        total_c = cfg.total_downsample
-        prompt_len = idx.shape[1]
-        excess = prompt_len % total_c
-        if excess > 0:
-            idx = idx[:, excess:]  # left-truncate, keeps most recent context
-            prompt_len = idx.shape[1]
-        assert prompt_len >= total_c, "prompt too short for chunking configuration"
-
-        C0, C1 = cfg.levels[0].chunk_size, cfg.levels[1].chunk_size
-        R1 = cfg.levels[1].prefix_len
-
-        tokens = idx.clone()
-        x0 = self.embed(tokens)
-
-        # --- prefill: one full bottom-up pass over the prompt. Only the
-        # top-level encoder KV is retained for decoding. ---
-        a1 = self.chunkers[0](x0)
-        x1 = self.encoders[0](a1)                      # true X^1 over prompt (no KV kept)
-        enc1_kv = self.encoders[1].new_kv_caches()     # top-level KV: the only growing cache
-        a2 = self.chunkers[1](x1)
-        x2 = self.encoders[1](a2, kv_caches=enc1_kv)
-
-        latest_x1_est = x1[:, -1, :]   # last true X^1 latent (chunk index k-1)
-        latest_x2 = x2[:, -1, :]
-
-        dec1 = self.decoders[1]
-        dec1_kv = None                  # reset at each level-2 chunk boundary
-        xhat1_buffer: list = []         # X-hat^1 latents accumulated toward the next X^2
-
-        chunk_idx = 0                   # level-1 chunks generated so far (mod C1 matters)
-        generated_total = 0
-        while generated_total < max_new_tokens:
-            n_new = min(C0, max_new_tokens - generated_total)
-            new_tokens_chunk = self._sample_chunk_tokens(latest_x1_est, n_new, temperature, top_k)
-            tokens = torch.cat([tokens, new_tokens_chunk], dim=1)
-            generated_total += n_new
-            if n_new < C0:
-                break  # partial final chunk: no state advance needed
-
-            # --- advance the X^1 stream via the level-1 decoder (no re-encoding) ---
-            if chunk_idx % C1 == 0:
-                # level-2 chunk boundary: fresh local window conditioned on latest X^2
-                U1 = self.converters[1].forward_one(latest_x2)  # (B, R1, D1)
-                dec1_kv = dec1.new_kv_caches()
-                dec1(U1, kv_caches=dec1_kv)              # prefill prefix (output unused)
-                h = dec1(U1[:, -1:, :], kv_caches=dec1_kv)  # training's "dup" position
-            else:
-                h = dec1(latest_x1_est.unsqueeze(1), kv_caches=dec1_kv)
-            latest_x1_est = h[:, -1, :]                  # X-hat^1 for the chunk just completed
-            xhat1_buffer.append(latest_x1_est)
-            chunk_idx += 1
-
-            # --- refresh top-level X^2 from reconstructions every C1 chunks ---
-            if chunk_idx % C1 == 0:
-                stack = torch.stack(xhat1_buffer, dim=1)  # (B, C1, D1)
-                xhat1_buffer = []
-                a2_new = self.chunkers[1](stack)
-                x2_new = self.encoders[1](a2_new, kv_caches=enc1_kv)
-                latest_x2 = x2_new[:, -1, :]
-        return tokens
+                         temperature: float = 1.0, top_k: Optional[int] = None) -> torch.Tensor:
+        """RecGen (paper Def. A.3). Works for any number of levels."""
+        return self._generate(idx, max_new_tokens, temperature, top_k, recgen=True)

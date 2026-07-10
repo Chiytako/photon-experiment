@@ -12,35 +12,24 @@ import torch
 
 from model.baseline import BaselineLM, BaselineConfig
 from model.photon import PhotonLM, PhotonConfig, LevelConfig
+from data import window_size, split_input_target
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 CKPT_DIR = os.path.join(os.path.dirname(__file__), "checkpoints")
 
 
-def get_batch(arr, batch_size, seq_len, device, arch):
-    """Returns (input, target).
-
-    For `baseline` (a plain causal transformer, where position j's causal
-    self-attention includes token j itself), inputs and targets must be
-    offset by one position -- otherwise the model trivially "predicts" token
-    j from token j via self-attention, collapsing loss to ~0 with no genuine
-    learning. For `photon`, the shift is already baked into the decoder's
-    own construction (verified by the causality unit tests: logits at
-    position j provably do not depend on token j or later), so target=input
-    is correct there and shifting again would be wrong.
-    """
-    if arch == "baseline":
-        max_start = len(arr) - seq_len - 1
-        ix = np.random.randint(0, max_start, size=batch_size)
-        chunk = np.stack([arr[i:i + seq_len + 1].astype(np.int64) for i in ix])
-        chunk = torch.from_numpy(chunk).to(device, non_blocking=True)
-        return chunk[:, :-1], chunk[:, 1:]
-    else:
-        max_start = len(arr) - seq_len - 1
-        ix = np.random.randint(0, max_start, size=batch_size)
-        x = np.stack([arr[i:i + seq_len].astype(np.int64) for i in ix])
-        x = torch.from_numpy(x).to(device, non_blocking=True)
-        return x, x
+def get_batch(arr, batch_size, seq_len, device, arch, rng):
+    """Sample a batch of (input, target) windows. The shift rule lives in
+    data.split_input_target (shared with evaluate.py). `rng` is an explicitly
+    seeded np.random.Generator so --seed actually makes batch order
+    reproducible (torch.manual_seed does not seed NumPy)."""
+    win = window_size(seq_len, arch)
+    max_start = len(arr) - win  # inclusive upper bound for a full window
+    assert max_start >= 0, f"data has {len(arr)} tokens, need >= {win}"
+    ix = rng.integers(0, max_start + 1, size=batch_size)
+    chunk = np.stack([arr[i:i + win].astype(np.int64) for i in ix])
+    chunk = torch.from_numpy(chunk).to(device, non_blocking=True)
+    return split_input_target(chunk, arch)
 
 
 def cosine_lr(step, warmup_steps, max_steps, max_lr, min_lr_ratio=0.1):
@@ -53,18 +42,21 @@ def cosine_lr(step, warmup_steps, max_steps, max_lr, min_lr_ratio=0.1):
     return max_lr * min_lr_ratio + (max_lr - max_lr * min_lr_ratio) * coeff
 
 
-# Preset shapes. "small" is the original ~36-44M pair from the first round of
-# experiments; "medium" targets a ~150-190M matched pair for the scale-up run.
+# Preset shapes, following the paper's configurations (Appendix C.2) scaled
+# down to GB10 budgets: PHOTON uses the SAME hidden width at every level
+# (e.g. 1664 everywhere for their 600M model) and the same layer count in all
+# four stacks (enc1/enc2/dec2/dec1); we mirror that shape. The baseline is
+# matched by total transformer layers at the same width.
 BASELINE_PRESETS = {
     "small": dict(dim=512, n_layers=8, n_heads=8, mlp_hidden=1536),
     "medium": dict(dim=1024, n_layers=12, n_heads=16, mlp_hidden=2816),
 }
 PHOTON_PRESETS = {
-    # (d0, per-level [dim, enc_layers, heads, mlp] bottom→top)
-    "small": dict(d0=256, level_dims=[384, 512], layers=3, heads=[6, 8],
-                   mlps=[1024, 1536]),
-    "medium": dict(d0=512, level_dims=[768, 1024], layers=4, heads=[12, 16],
-                    mlps=[2048, 2816]),
+    # paper-shape: uniform width, 4 stacks x `layers` (= baseline n_layers total)
+    "small": dict(d0=512, level_dims=[512, 512], layers=2, heads=[8, 8],
+                   mlps=[1536, 1536]),
+    "medium": dict(d0=1024, level_dims=[1024, 1024], layers=3, heads=[16, 16],
+                    mlps=[2816, 2816]),
 }
 
 
@@ -94,16 +86,21 @@ def build_model(arch: str, seq_len: int, preset: str = "small",
 
 
 @torch.no_grad()
-def evaluate(model, val_arr, batch_size, seq_len, device, arch, iters=20):
+def evaluate(model, val_arr, batch_size, seq_len, device, arch, rng, iters=20):
+    """Returns (mean combined loss, mean token-only loss). Perplexity must be
+    computed from the token loss: for PHOTON with alpha>0 the combined loss
+    also contains the reconstruction term and exp(combined) is NOT a
+    perplexity."""
     model.eval()
-    losses = []
+    losses, token_losses = [], []
     for _ in range(iters):
-        x, y = get_batch(val_arr, batch_size, seq_len, device, arch)
+        x, y = get_batch(val_arr, batch_size, seq_len, device, arch, rng)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            _, loss = model(x, y)
+            _, loss, parts = model(x, y, return_parts=True)
         losses.append(loss.item())
+        token_losses.append(parts["token_loss"].item())
     model.train()
-    return sum(losses) / len(losses)
+    return sum(losses) / len(losses), sum(token_losses) / len(token_losses)
 
 
 def main():
@@ -147,6 +144,7 @@ def main():
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
+    rng = np.random.default_rng(args.seed)  # batch sampling; NumPy's global RNG is NOT seeded by torch.manual_seed
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     device = "cuda"
@@ -181,40 +179,49 @@ def main():
 
     t_start = time.time()
     running_loss = 0.0
+    running_token_loss = 0.0
     running_count = 0
     for step in range(max_steps):
         lr = cosine_lr(step, args.warmup_steps, max_steps, args.lr)
         for pg in opt.param_groups:
             pg["lr"] = lr
 
-        x, y = get_batch(train_arr, args.batch_size, args.seq_len, device, args.arch)
+        x, y = get_batch(train_arr, args.batch_size, args.seq_len, device, args.arch, rng)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            _, loss = train_model(x, y)
+            _, loss, parts = train_model(x, y, return_parts=True)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         opt.step()
 
         running_loss += loss.item()
+        running_token_loss += parts["token_loss"].item()
         running_count += 1
 
         if step % args.log_every == 0 or step == max_steps - 1:
             elapsed = time.time() - t_start
             toks_per_sec = (step + 1) * tokens_per_step / elapsed if elapsed > 0 else 0
             avg_loss = running_loss / max(1, running_count)
-            print(f"[{args.run_name}] step {step}/{max_steps} loss={avg_loss:.4f} lr={lr:.2e} "
+            avg_token_loss = running_token_loss / max(1, running_count)
+            print(f"[{args.run_name}] step {step}/{max_steps} loss={avg_loss:.4f} "
+                  f"token_loss={avg_token_loss:.4f} lr={lr:.2e} "
                   f"tok/s={toks_per_sec:.0f} elapsed={elapsed:.0f}s")
-            log_f.write(json.dumps({"step": step, "train_loss": avg_loss, "lr": lr,
+            log_f.write(json.dumps({"step": step, "train_loss": avg_loss,
+                                     "train_token_loss": avg_token_loss, "lr": lr,
                                      "tok_per_s": toks_per_sec, "elapsed": elapsed}) + "\n")
             log_f.flush()
             running_loss = 0.0
+            running_token_loss = 0.0
             running_count = 0
 
         if (step > 0 and step % args.eval_every == 0) or step == max_steps - 1:
-            val_loss = evaluate(train_model, val_arr, args.batch_size, args.seq_len, device, args.arch)
-            val_ppl = math.exp(min(val_loss, 20))
-            print(f"[{args.run_name}] step {step} VAL loss={val_loss:.4f} ppl={val_ppl:.2f}")
-            log_f.write(json.dumps({"step": step, "val_loss": val_loss, "val_ppl": val_ppl}) + "\n")
+            val_loss, val_token_loss = evaluate(train_model, val_arr, args.batch_size,
+                                                args.seq_len, device, args.arch, rng)
+            val_ppl = math.exp(min(val_token_loss, 20))  # PPL from token loss ONLY
+            print(f"[{args.run_name}] step {step} VAL loss={val_loss:.4f} "
+                  f"token_loss={val_token_loss:.4f} ppl={val_ppl:.2f}")
+            log_f.write(json.dumps({"step": step, "val_loss": val_loss,
+                                     "val_token_loss": val_token_loss, "val_ppl": val_ppl}) + "\n")
             log_f.flush()
 
     torch.save({"model_state": model.state_dict(), "cfg": cfg, "arch": args.arch,

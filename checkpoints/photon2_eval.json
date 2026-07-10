@@ -1,0 +1,10 @@
+{
+  "arch": "photon",
+  "run_name": "photon2",
+  "n_params": 47854592,
+  "eval_seq_len": 1024,
+  "fineweb_val_loss": 7.0496542208388835,
+  "fineweb_val_ppl": 1152.4601771662358,
+  "wikitext_loss": 7.512793095620187,
+  "wikitext_ppl": 1831.321461997186
+}

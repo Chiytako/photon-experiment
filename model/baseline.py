@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .transformer_blocks import TransformerStack
+from .transformer_blocks import TransformerStack, sample_token
 
 
 @dataclass
@@ -48,13 +48,18 @@ class BaselineLM(nn.Module):
             n -= self.tok_emb.weight.numel()
         return n
 
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None):
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None,
+                return_parts: bool = False):
         x = self.tok_emb(idx)
         x = self.stack(x)
         logits = self.lm_head(x)
         loss = None
+        parts = None
         if targets is not None:
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
+            parts = {"token_loss": loss, "recon_loss": loss.new_zeros(())}
+        if return_parts:
+            return logits, loss, parts
         return logits, loss
 
     @torch.no_grad()
@@ -62,26 +67,13 @@ class BaselineLM(nn.Module):
                  top_k: int = None):
         """idx: (B, T) prompt tokens. Uses incremental KV cache for O(1) per-step decode."""
         kv_caches = self.stack.new_kv_caches()
-        x = self.tok_emb(idx)
-        h = x
-        for i, layer in enumerate(self.stack.layers):
-            h = layer(h, kv_cache=kv_caches[i])
-        h = self.stack.norm_out(h)
-        logits = self.lm_head(h[:, -1:, :])
+        h = self.stack(self.tok_emb(idx), kv_caches=kv_caches)
+        logits = self.lm_head(h[:, -1, :])
 
-        generated = idx
+        out_toks = [idx]
         for _ in range(max_new_tokens):
-            logits = logits[:, -1, :] / max(temperature, 1e-5)
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('inf')
-            probs = F.softmax(logits, dim=-1)
-            next_tok = torch.multinomial(probs, num_samples=1)
-            generated = torch.cat([generated, next_tok], dim=1)
-
-            h = self.tok_emb(next_tok)
-            for i, layer in enumerate(self.stack.layers):
-                h = layer(h, kv_cache=kv_caches[i])
-            h = self.stack.norm_out(h)
-            logits = self.lm_head(h)
-        return generated
+            next_tok = sample_token(logits, temperature, top_k)
+            out_toks.append(next_tok)
+            h = self.stack(self.tok_emb(next_tok), kv_caches=kv_caches)
+            logits = self.lm_head(h[:, -1, :])
+        return torch.cat(out_toks, dim=1)

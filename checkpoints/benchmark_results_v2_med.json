@@ -1,0 +1,46 @@
+{
+  "baseline": {
+    "prefill_heavy": {
+      "prompt_len": 2048,
+      "gen_len": 128,
+      "batch_size": 4,
+      "wall_time_s": 1.5416078567504883,
+      "throughput_tok_per_s": 332.1207775103264,
+      "kv_cache_gib": 0.3984375,
+      "tpm_k_tok_per_s_per_gib": 0.8335580298298387,
+      "peak_mem_gib_secondary": 1.9384636878967285
+    },
+    "decode_heavy": {
+      "prompt_len": 128,
+      "gen_len": 2048,
+      "batch_size": 4,
+      "wall_time_s": 9.854420900344849,
+      "throughput_tok_per_s": 831.3020199607394,
+      "kv_cache_gib": 0.3984375,
+      "tpm_k_tok_per_s_per_gib": 2.086405069705385,
+      "peak_mem_gib_secondary": 1.9061226844787598
+    }
+  },
+  "photon": {
+    "prefill_heavy": {
+      "prompt_len": 2048,
+      "gen_len": 128,
+      "batch_size": 4,
+      "wall_time_s": 0.21393942832946777,
+      "throughput_tok_per_s": 2393.200748445104,
+      "kv_cache_gib": 0.0311279296875,
+      "tpm_k_tok_per_s_per_gib": 76.88274718142077,
+      "peak_mem_gib_secondary": 1.3544363975524902
+    },
+    "decode_heavy": {
+      "prompt_len": 128,
+      "gen_len": 2048,
+      "batch_size": 4,
+      "wall_time_s": 1.3553330898284912,
+      "throughput_tok_per_s": 6044.270638324521,
+      "kv_cache_gib": 0.0311279296875,
+      "tpm_k_tok_per_s_per_gib": 194.17515713393914,
+      "peak_mem_gib_secondary": 1.3027853965759277
+    }
+  }
+}

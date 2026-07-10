@@ -14,6 +14,32 @@ DATASET_NAME = "HuggingFaceFW/fineweb-edu"
 DATASET_CONFIG = "sample-10BT"
 
 
+def window_size(seq_len: int, arch: str) -> int:
+    """Raw-token window length needed to build one (input, target) pair.
+    baseline needs seq_len+1 tokens (targets are inputs shifted by one);
+    photon needs exactly seq_len (the causal shift is baked into the model's
+    converter conditioning, so target == input)."""
+    return seq_len + 1 if arch == "baseline" else seq_len
+
+
+def split_input_target(chunk, arch: str):
+    """chunk: (B, window_size) int64 token tensor. Returns (input, target).
+
+    For `baseline` (a plain causal transformer, where position j's causal
+    self-attention includes token j itself), inputs and targets must be
+    offset by one position -- otherwise the model trivially "predicts" token
+    j from token j via self-attention, collapsing loss to ~0 with no genuine
+    learning. For `photon`, position j's reconstruction provably depends only
+    on strictly-prior context (see tests/test_models.py), so target=input is
+    correct there and shifting again would be wrong.
+
+    This is the single source of truth for the shift rule, shared by
+    train.py and evaluate.py."""
+    if arch == "baseline":
+        return chunk[:, :-1], chunk[:, 1:]
+    return chunk, chunk
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out_dir", default=os.path.join(os.path.dirname(__file__), "data"))

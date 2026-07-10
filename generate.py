@@ -26,9 +26,11 @@ def main():
 
     ids = tok(args.prompt, add_special_tokens=False)["input_ids"]
     if arch == "photon":
+        # left-pad with EOS up to a full multiple of total_downsample, so the
+        # model's internal alignment never has to drop prompt tokens
         total_c = cfg.total_downsample
-        if len(ids) < total_c:
-            ids = [tok.eos_token_id] * (total_c - len(ids)) + ids
+        target_len = max(total_c, -(-len(ids) // total_c) * total_c)
+        ids = [tok.eos_token_id] * (target_len - len(ids)) + ids
     idx = torch.tensor([ids], dtype=torch.long, device=device)
 
     gen_fn = model.generate

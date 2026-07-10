@@ -1,7 +1,7 @@
 #!/bin/bash
-# Ablation sweep: 5 small-PHOTON training runs (200M tokens each, ~27 min each
-# with --compile) + evaluation after each. Baseline reference point is the
-# existing checkpoints/photon_final.pt (alpha=0, C=(4,4), R=(4,4)).
+# Ablation sweep: 5 small-PHOTON training runs (200M tokens each) + evaluation
+# after each. Reference point is the alpha=0, C=(4,4), R=(4,4) small run
+# (produced separately, e.g. checkpoints/photon2.pt from scripts/run_v2.sh).
 set -e
 cd ~/photon-experiment
 source .venv/bin/activate

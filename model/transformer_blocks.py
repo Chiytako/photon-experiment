@@ -55,7 +55,57 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
 
 
 class KVCache:
-    """Simple growable KV cache for a single attention layer."""
+    """Growable KV cache for a single attention layer. Preallocates capacity
+    and grows by doubling, writing new steps via slice assignment, so a
+    T-step decode costs O(T) copies total instead of the O(T^2) of
+    per-step torch.cat. Only used under no_grad (generation)."""
+
+    def __init__(self, capacity_hint: int = 64):
+        self.k: Optional[torch.Tensor] = None
+        self.v: Optional[torch.Tensor] = None
+        self._len = 0
+        self._capacity_hint = capacity_hint
+
+    def _ensure(self, template: torch.Tensor, needed: int):
+        B, H, _, D = template.shape
+        if self.k is None:
+            cap = max(needed, self._capacity_hint)
+            self.k = template.new_empty(B, H, cap, D)
+            self.v = template.new_empty(B, H, cap, D)
+        elif needed > self.k.shape[2]:
+            cap = max(needed, 2 * self.k.shape[2])
+            for name in ("k", "v"):
+                old = getattr(self, name)
+                new = template.new_empty(B, H, cap, D)
+                new[:, :, :self._len] = old[:, :, :self._len]
+                setattr(self, name, new)
+
+    def append(self, k: torch.Tensor, v: torch.Tensor):
+        T = k.shape[2]
+        self._ensure(k, self._len + T)
+        self.k[:, :, self._len:self._len + T] = k
+        self.v[:, :, self._len:self._len + T] = v
+        self._len += T
+        return self.k[:, :, :self._len], self.v[:, :, :self._len]
+
+    @property
+    def length(self) -> int:
+        return self._len
+
+    def logical_bytes(self) -> int:
+        """Bytes of live K+V entries (logical length, not allocated capacity);
+        used for the paper-protocol KV-memory accounting in benchmark.py."""
+        if self.k is None:
+            return 0
+        B, H, _, D = self.k.shape
+        return 2 * B * H * self._len * D * self.k.element_size()
+
+
+class GradKVCache:
+    """Concatenation-based KV cache, autograd-safe (no in-place writes).
+    Used by PHOTON's differentiable within-chunk latent recursion during
+    training; the O(len^2) copy growth of torch.cat is irrelevant at the
+    bounded window sizes involved (<= R_l + C_l)."""
 
     def __init__(self):
         self.k: Optional[torch.Tensor] = None
@@ -72,6 +122,18 @@ class KVCache:
     @property
     def length(self) -> int:
         return 0 if self.k is None else self.k.shape[2]
+
+
+def sample_token(logits: torch.Tensor, temperature: float = 1.0,
+                 top_k: Optional[int] = None) -> torch.Tensor:
+    """Temperature + top-k sampling shared by BaselineLM and PhotonLM.
+    logits: (N, vocab). Returns (N, 1) sampled token ids."""
+    logits = logits / max(temperature, 1e-5)
+    if top_k is not None:
+        v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+        logits = logits.masked_fill(logits < v[:, [-1]], -float("inf"))
+    probs = F.softmax(logits, dim=-1)
+    return torch.multinomial(probs, num_samples=1)
 
 
 class CausalSelfAttention(nn.Module):
